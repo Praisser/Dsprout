@@ -22,6 +22,7 @@ use std::{
 };
 
 const ROOT_SECRET: &[u8] = b"dsprout-dev-root-secret-v1";
+const WORKER_HEALTH_MAX_AGE_MS: u128 = 30_000;
 
 #[derive(Debug, Clone)]
 struct CommonArgs {
@@ -34,7 +35,6 @@ struct UploadArgs {
     common: CommonArgs,
     input: PathBuf,
     file_id: Option<String>,
-    workers: Vec<Multiaddr>,
     replication_factor: usize,
 }
 
@@ -240,7 +240,6 @@ fn parse_command() -> Result<Command> {
     let mut input: Option<PathBuf> = None;
     let mut output: Option<PathBuf> = None;
     let mut file_id: Option<String> = None;
-    let mut workers: Vec<Multiaddr> = Vec::new();
     let mut replication_factor: usize = 2;
 
     let mut i = 0usize;
@@ -282,13 +281,6 @@ fn parse_command() -> Result<Command> {
                         .clone(),
                 );
             }
-            "--worker" => {
-                i += 1;
-                let v = args
-                    .get(i)
-                    .ok_or_else(|| anyhow::anyhow!("missing value for --worker"))?;
-                workers.push(v.parse()?);
-            }
             "--replication-factor" => {
                 i += 1;
                 let v = args
@@ -315,7 +307,6 @@ fn parse_command() -> Result<Command> {
             common,
             input: input.ok_or_else(|| anyhow::anyhow!("--input is required for upload"))?,
             file_id,
-            workers,
             replication_factor,
         })),
         "download" => Ok(Command::Download(DownloadArgs {
@@ -355,6 +346,13 @@ fn create_file_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
+fn now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+}
+
 async fn connect_worker(common: &CommonArgs, multiaddr: Multiaddr) -> Result<WorkerConnection> {
     let swarm_key = common
         .swarm_key
@@ -387,24 +385,31 @@ async fn connect_worker(common: &CommonArgs, multiaddr: Multiaddr) -> Result<Wor
 async fn resolve_upload_workers(
     common: &CommonArgs,
     satellite: &SatelliteClient,
-    explicit: &[Multiaddr],
 ) -> Result<Vec<WorkerConnection>> {
-    let worker_addrs: Vec<Multiaddr> = if explicit.is_empty() {
-        let mut addrs = Vec::new();
-        for w in satellite.workers().await? {
-            if let Ok(addr) = w.multiaddr.parse() {
-                addrs.push(addr);
-            }
+    let now = now_ms();
+    let mut worker_addrs: Vec<Multiaddr> = Vec::new();
+    let mut unhealthy = 0usize;
+    let mut invalid_addr = 0usize;
+    for w in satellite.workers().await? {
+        if now.saturating_sub(w.last_seen) > WORKER_HEALTH_MAX_AGE_MS {
+            unhealthy += 1;
+            continue;
         }
-        addrs
-    } else {
-        explicit.to_vec()
-    };
+        match w.multiaddr.parse() {
+            Ok(addr) => worker_addrs.push(addr),
+            Err(_) => invalid_addr += 1,
+        }
+    }
 
     if worker_addrs.is_empty() {
-        return Err(anyhow::anyhow!(
-            "no workers provided and /workers returned none"
-        ));
+        return Err(anyhow::anyhow!("no healthy workers discovered from /workers"));
+    }
+
+    if unhealthy > 0 || invalid_addr > 0 {
+        eprintln!(
+            "worker discovery filtered: unhealthy={} invalid_multiaddr={}",
+            unhealthy, invalid_addr
+        );
     }
 
     let mut out = Vec::new();
@@ -426,7 +431,7 @@ async fn resolve_upload_workers(
 
 async fn run_upload(args: UploadArgs) -> Result<()> {
     let satellite = SatelliteClient::new(args.common.satellite_url.clone());
-    let mut workers = resolve_upload_workers(&args.common, &satellite, &args.workers).await?;
+    let mut workers = resolve_upload_workers(&args.common, &satellite).await?;
     if args.replication_factor == 0 {
         return Err(anyhow::anyhow!(
             "--replication-factor must be >= 1 for upload"

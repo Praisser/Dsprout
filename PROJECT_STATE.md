@@ -1,6 +1,6 @@
 # PROJECT_STATE
 
-Last updated after Milestone 8.
+Last updated after Milestone 9.
 
 ## current architecture
 
@@ -12,9 +12,9 @@ Last updated after Milestone 8.
 - `server/dsprout-common`:
 - shared identity, pnet loader, crypto, sharding, hashing, libp2p request/response protocol, shared durable manifest/signed-manifest models.
 - `server/dsprout-worker`:
-- libp2p worker node with profile-scoped local shard storage, RAM hot-cache, shard store/prepare/verify handlers, startup shard inventory scan + re-registration, CLI profile/listen config, satellite registration/heartbeat.
+- libp2p worker node with profile-scoped local shard storage, RAM hot-cache, shard store/prepare/verify handlers, startup shard inventory scan + re-registration, registration + heartbeat.
 - `server/dsprout-uplink`:
-- libp2p client, upload/download pipeline, satellite client, multi-worker placement, shard replication (`--replication-factor`, default `2`), local signed-manifest cache, manifest register/fetch logic.
+- libp2p client with satellite-driven worker discovery for upload (`GET /workers`), health filtering by `last_seen`, shard replication, signed manifest handling, and shard retrieval via `/locate` metadata.
 - `server/dsprout-satellite`:
 - axum registry/index service for workers, shard locations, and signed manifests with SQLite-backed persistence and startup reload.
 
@@ -36,31 +36,21 @@ Last updated after Milestone 8.
 
 - Satellite persistence:
 - SQLite database at `~/Library/Application Support/dsprout/satellite.sqlite3`
-- Persisted tables: workers, shard records, signed manifests
+- Persisted workers, shard records, signed manifests
 - Startup restores in-memory maps from SQLite
-- `register_shard` is now idempotent (upsert semantics for same file/segment/shard/worker)
+- Shard registration remains idempotent/upsert-safe
 
 ## files changed
 
-- `server/dsprout-worker/src/store.rs`
-- Added startup inventory scanner: `scan_local_shards()`.
-- Added `DiscoveredShard` model with reconstructed metadata from file layout.
-- Added profile-scoped storage root via `set_store_profile()` so workers do not share local shard directories.
+- `server/dsprout-uplink/src/main.rs`
+- Upload worker selection now uses satellite discovery (`GET /workers`) only.
+- Removed manual `--worker` argument parsing from upload flow.
+- Added worker health filtering via `last_seen` (exclude workers older than 30 seconds).
+- Upload placement uses only discovered healthy workers.
+- Download flow continues dialing workers from `/locate` shard metadata.
 
-- `server/dsprout-worker/src/main.rs`
-- Worker startup now calls `set_store_profile(run.profile)`.
-- Added `reregister_local_shards()` to compute shard hashes and call satellite `/register_shard` for discovered local shards.
-- Added startup log: `Startup shard inventory re-registered: <count>`.
-- Kept worker registration + heartbeat behavior compatible.
-
-- `server/dsprout-satellite/src/main.rs`
-- Added idempotent shard handling:
-- SQLite upsert for shard records on conflict (`file_id, segment_index, shard_index, worker_id`).
-- In-memory shard index upsert/update instead of blind append.
-- Added SQLite dedup migration and unique index for shard identity.
-
-- `server/Cargo.lock`
-- Updated due dependency graph/state changes.
+- `PROJECT_STATE.md`
+- Updated architecture, commands, validations, and current milestone status.
 
 ## commands to run
 
@@ -84,72 +74,76 @@ cargo run -p dsprout-satellite
 
 ```bash
 cd server
-cargo run -p dsprout-worker -- --profile w1 --listen /ip4/127.0.0.1/tcp/5501 --satellite-url http://127.0.0.1:7070
-cargo run -p dsprout-worker -- --profile w2 --listen /ip4/127.0.0.1/tcp/5502 --satellite-url http://127.0.0.1:7070
-cargo run -p dsprout-worker -- --profile w3 --listen /ip4/127.0.0.1/tcp/5503 --satellite-url http://127.0.0.1:7070
+cargo run -p dsprout-worker -- --profile w1 --listen /ip4/127.0.0.1/tcp/5601 --satellite-url http://127.0.0.1:7070
+cargo run -p dsprout-worker -- --profile w2 --listen /ip4/127.0.0.1/tcp/5602 --satellite-url http://127.0.0.1:7070
+cargo run -p dsprout-worker -- --profile w3 --listen /ip4/127.0.0.1/tcp/5603 --satellite-url http://127.0.0.1:7070
+cargo run -p dsprout-worker -- --profile w4 --listen /ip4/127.0.0.1/tcp/5604 --satellite-url http://127.0.0.1:7070
 ```
 
-### 4) Upload (replication factor 2)
+### 4) Upload using only satellite discovery (no `--worker` args)
 
 ```bash
 cd server
 cargo run -p dsprout-uplink -- upload \
   --satellite-url http://127.0.0.1:7070 \
   --input /tmp/input.bin \
-  --file-id milestone8-e2e \
-  --replication-factor 2 \
-  --worker /ip4/127.0.0.1/tcp/5501 \
-  --worker /ip4/127.0.0.1/tcp/5502 \
-  --worker /ip4/127.0.0.1/tcp/5503
+  --file-id milestone9-e2e \
+  --replication-factor 2
 ```
 
-### 5) Restart worker and verify re-registration path
-
-```bash
-# stop worker w1 and start it again with same profile/listen
-cd server
-cargo run -p dsprout-worker -- --profile w1 --listen /ip4/127.0.0.1/tcp/5501 --satellite-url http://127.0.0.1:7070
-# observe: "Startup shard inventory re-registered: <count>"
-```
-
-### 6) Download and verify
+### 5) Download using only satellite URL + file ID
 
 ```bash
 cd server
 cargo run -p dsprout-uplink -- download \
   --satellite-url http://127.0.0.1:7070 \
-  --file-id milestone8-e2e \
+  --file-id milestone9-e2e \
   --output /tmp/output.bin
+```
+
+### 6) Byte equality check
+
+```bash
 cmp -s /tmp/input.bin /tmp/output.bin && echo "MATCH" || echo "MISMATCH"
+```
+
+### 7) Offline-worker recovery check
+
+```bash
+# stop some workers, then run:
+cd server
+cargo run -p dsprout-uplink -- download \
+  --satellite-url http://127.0.0.1:7070 \
+  --file-id milestone9-e2e \
+  --output /tmp/output_offline.bin
+cmp -s /tmp/input.bin /tmp/output_offline.bin && echo "MATCH" || echo "MISMATCH"
 ```
 
 ## validations passed
 
-Milestone 8 validation executed successfully:
+Milestone 9 validation executed successfully:
 
-- Upload succeeded.
-- Worker was stopped and restarted.
-- Restarted worker scanned local storage and re-registered inventory.
-- Satellite reflected restarted worker shard records after re-registration.
-- Download still succeeded afterward.
-- Restored file matched original exactly (`cmp` success).
+- Upload works with only `--satellite-url` (no manual `--worker` args).
+- Download works with only `--satellite-url` + `--file-id` + `--output`.
+- Download still succeeds with some workers offline.
+- Worker discovery health filtering is active (stale workers excluded by `last_seen`).
 
 Observed result set from validation run:
-- `FILE_ID=milestone8-e2e-1772968072`
-- `WORKER1_ID=12D3KooWRTRuw9HBNsu4eHfukxHCR9GrbUmzRyLtzTzzsQKn8ER2`
-- `UPLOAD_OK=1`
-- `WORKER_RESTARTED=1`
-- `WORKER_REREGISTER_RECORDS=53`
-- `WORKER_STARTUP_REREG_COUNT=53`
-- `DOWNLOAD_AFTER_WORKER_RESTART_OK=1`
-- `CMP_OK=1`
+- `FILE_ID=milestone9-e2e-1772968430`
+- `UPLOAD_ONLY_SATELLITE_URL_OK=1`
+- `DOWNLOAD_ONLY_SATELLITE_URL_OK=1`
+- `DOWNLOAD_WITH_OFFLINE_WORKERS_OK=1`
+- `UNHEALTHY_FILTER_LOG=worker discovery filtered: unhealthy=4 invalid_multiaddr=0`
+- `CMP_ALL_OK=1`
+- `CMP_OFFLINE_OK=1`
 
 ## remaining warnings/issues
 
+- Health threshold is fixed at 30 seconds in uplink (`WORKER_HEALTH_MAX_AGE_MS`), not yet configurable.
 - SQLite writes are synchronous and optimized for simplicity, not throughput.
 - No shard compaction/retention policy yet.
-- `server/swarm.key` is local secret material and intentionally git-ignored at repo root.
-- No Kademlia/bootstrap/gossipsub/discovery yet (intentionally out of scope).
+- `server/swarm.key` is local secret material and intentionally git-ignored.
+- No Kademlia/bootstrap/gossipsub/discovery protocol yet (intentionally out of scope).
 - No frontend integration yet (intentionally out of scope).
 - No cloud deployment/performance optimization yet (intentionally out of scope).
 

@@ -1,6 +1,6 @@
 # PROJECT_STATE
 
-Last updated after Milestone 6.
+Last updated after Milestone 7.
 
 ## current architecture
 
@@ -16,7 +16,7 @@ Last updated after Milestone 6.
 - `server/dsprout-uplink`:
 - libp2p client, upload/download pipeline, satellite client, multi-worker placement, shard replication (`--replication-factor`, default `2`), local signed-manifest cache, manifest register/fetch logic.
 - `server/dsprout-satellite`:
-- axum registry/index service for workers, shard locations (including replicas), and signed manifests.
+- axum registry/index service for workers, shard locations, and signed manifests, now with SQLite-backed persistence and startup reload.
 
 - Network protocol (request-response over private libp2p transport):
 - `Hello` / `HelloAck`
@@ -25,7 +25,7 @@ Last updated after Milestone 6.
 - `StoreShard` / `StoreShardAck`
 - `Error`
 
-- Satellite HTTP API:
+- Satellite HTTP API (compatible behavior retained):
 - `POST /register_worker`
 - `POST /heartbeat`
 - `GET /workers`
@@ -34,20 +34,29 @@ Last updated after Milestone 6.
 - `POST /register_manifest`
 - `GET /manifest?file_id=...`
 
-- libp2p transport stack:
-- Ed25519 identity (profile-scoped key files)
-- PSK private network via `server/swarm.key`
-- TCP + pnet + noise + yamux
-- identify + request_response behaviours
+- Satellite persistence:
+- SQLite database at `~/Library/Application Support/dsprout/satellite.sqlite3`
+- Persisted tables: workers, shard records, signed manifests
+- On startup, satellite loads persisted records into in-memory indexes
+- On writes, endpoints persist updates and keep in-memory state in sync
 
 ## files changed
 
-- `server/dsprout-uplink/src/main.rs`
-- Added upload-time replication factor support via `--replication-factor` (default `2`).
-- Upload now stores each shard on multiple workers per replication factor.
-- Upload now registers all shard replica locations with satellite.
-- Added validation guards: replication factor must be `>= 1` and `<= connected workers`.
-- Download continues using any reachable replica per shard (now with richer satellite shard records due to replication).
+- `server/dsprout-satellite/src/main.rs`
+- Added `PersistentStore` with SQLite schema creation and CRUD for workers/shards/manifests.
+- Added startup load path to rebuild in-memory maps from persisted records.
+- Updated write handlers to persist on:
+- `register_worker`
+- `heartbeat`
+- `register_shard`
+- `register_manifest`
+- Kept HTTP API routes and response semantics compatible.
+
+- `server/dsprout-satellite/Cargo.toml`
+- Added `rusqlite` (bundled SQLite) and `dirs` dependencies.
+
+- `server/Cargo.lock`
+- Updated for new satellite dependencies.
 
 ## commands to run
 
@@ -67,88 +76,85 @@ cd server
 cargo run -p dsprout-satellite
 ```
 
-### 3) Start workers (example with 5 workers for stronger recovery test)
+### 3) Start workers (example)
 
 ```bash
 cd server
-cargo run -p dsprout-worker -- --profile w1 --listen /ip4/127.0.0.1/tcp/5201 --satellite-url http://127.0.0.1:7070
-cargo run -p dsprout-worker -- --profile w2 --listen /ip4/127.0.0.1/tcp/5202 --satellite-url http://127.0.0.1:7070
-cargo run -p dsprout-worker -- --profile w3 --listen /ip4/127.0.0.1/tcp/5203 --satellite-url http://127.0.0.1:7070
-cargo run -p dsprout-worker -- --profile w4 --listen /ip4/127.0.0.1/tcp/5204 --satellite-url http://127.0.0.1:7070
-cargo run -p dsprout-worker -- --profile w5 --listen /ip4/127.0.0.1/tcp/5205 --satellite-url http://127.0.0.1:7070
+cargo run -p dsprout-worker -- --profile w1 --listen /ip4/127.0.0.1/tcp/5301 --satellite-url http://127.0.0.1:7070
+cargo run -p dsprout-worker -- --profile w2 --listen /ip4/127.0.0.1/tcp/5302 --satellite-url http://127.0.0.1:7070
+cargo run -p dsprout-worker -- --profile w3 --listen /ip4/127.0.0.1/tcp/5303 --satellite-url http://127.0.0.1:7070
 ```
 
-### 4) Upload with replication factor 2
+### 4) Upload (replication factor 2)
 
 ```bash
 cd server
 cargo run -p dsprout-uplink -- upload \
   --satellite-url http://127.0.0.1:7070 \
   --input /tmp/input.bin \
-  --file-id milestone6-e2e \
+  --file-id milestone7-e2e \
   --replication-factor 2 \
-  --worker /ip4/127.0.0.1/tcp/5201 \
-  --worker /ip4/127.0.0.1/tcp/5202 \
-  --worker /ip4/127.0.0.1/tcp/5203 \
-  --worker /ip4/127.0.0.1/tcp/5204 \
-  --worker /ip4/127.0.0.1/tcp/5205
+  --worker /ip4/127.0.0.1/tcp/5301 \
+  --worker /ip4/127.0.0.1/tcp/5302 \
+  --worker /ip4/127.0.0.1/tcp/5303
 ```
 
-### 5) Download and reconstruct
+### 5) Restart-safety validation
 
 ```bash
+# 1) stop satellite process
+# 2) start satellite again
+cd server
+cargo run -p dsprout-satellite
+```
+
+### 6) Download after restart
+
+```bash
+# optional to force satellite-manifest path:
+rm -f "$HOME/Library/Application Support/dsprout/uplink_meta/milestone7-e2e.json"
+
 cd server
 cargo run -p dsprout-uplink -- download \
   --satellite-url http://127.0.0.1:7070 \
-  --file-id milestone6-e2e \
+  --file-id milestone7-e2e \
   --output /tmp/output.bin
 ```
 
-### 6) Byte equality check
+### 7) Byte equality check
 
 ```bash
-cmp -s /tmp/input.bin /tmp/output.bin && echo "MATCH" || echo "MISMATCH"
-```
-
-### 7) Stronger recovery validation (take two workers offline)
-
-```bash
-# stop any 2 workers, then:
-cd server
-cargo run -p dsprout-uplink -- download \
-  --satellite-url http://127.0.0.1:7070 \
-  --file-id milestone6-e2e \
-  --output /tmp/output.bin
 cmp -s /tmp/input.bin /tmp/output.bin && echo "MATCH" || echo "MISMATCH"
 ```
 
 ## validations passed
 
-Milestone 6 validation executed successfully:
+Milestone 7 validation executed successfully:
 
-- Build passed for `dsprout-uplink`, `dsprout-satellite`, and `dsprout-worker`.
-- Upload with `--replication-factor 2` succeeded.
-- Satellite registered replica locations for shards.
-- Download succeeded with two workers offline.
+- Build passed for `dsprout-satellite`, `dsprout-uplink`, and `dsprout-worker`.
+- Upload succeeded.
+- Satellite was stopped and restarted.
+- Local uplink manifest was deleted.
+- Download succeeded after satellite restart (using persisted satellite state).
 - Restored file matched original exactly (`cmp` success).
 
 Observed result set from validation run:
-- `FILE_ID=milestone6-e2e-1772966812`
-- `REPLICATION_FACTOR=2`
-- `OFFLINE_WORKERS=2`
+- `FILE_ID=milestone7-e2e-1772967128`
 - `UPLOAD_OK=1`
-- `DOWNLOAD_OK=1`
+- `SATELLITE_RESTARTED=1`
+- `LOCAL_MANIFEST_DELETED=1`
+- `DOWNLOAD_AFTER_RESTART_OK=1`
 - `CMP_OK=1`
+- `DB_PATH=/Users/apple/Library/Application Support/dsprout/satellite.sqlite3`
 
 ## remaining warnings/issues
 
-- Satellite manifest and shard indexes are currently in-memory only (not persistent across satellite restart).
+- SQLite writes are synchronous and optimized for simplicity, not throughput.
+- Shard record table currently appends entries; no dedup/pruning/compaction policy yet.
 - `server/swarm.key` is local secret material and intentionally git-ignored at repo root.
-- Replication strategy is simple deterministic placement; no adaptive policy/rebalancing yet.
 - No Kademlia/bootstrap/gossipsub/discovery yet (intentionally out of scope).
 - No frontend integration yet (intentionally out of scope).
-- Download reconnects to workers each run (acceptable for current milestone scope).
-- No advanced retry/backoff/telemetry around worker request failures yet.
+- No cloud deployment/performance optimization yet (intentionally out of scope).
 
 ## next milestone start guidance
 

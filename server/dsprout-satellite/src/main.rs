@@ -1,3 +1,4 @@
+use anyhow::{Result as AnyResult, anyhow};
 use axum::{
     Json, Router,
     http::StatusCode,
@@ -7,8 +8,203 @@ use dashmap::DashMap;
 use dsprout_common::models::{
     LocateResp, RegisterManifestReq, RegisterShardReq, ShardRecord, SignedManifest, WorkerInfo,
 };
+use rusqlite::{Connection, params};
 use serde::Deserialize;
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+};
+
+#[derive(Clone)]
+struct PersistentStore {
+    conn: Arc<Mutex<Connection>>,
+}
+
+impl PersistentStore {
+    fn open_default() -> AnyResult<Self> {
+        let base = dirs::data_dir().ok_or_else(|| anyhow!("No data_dir found"))?;
+        let dir = base.join("dsprout");
+        fs::create_dir_all(&dir)?;
+        Self::open(&dir.join("satellite.sqlite3"))
+    }
+
+    fn open(path: &Path) -> AnyResult<Self> {
+        let conn = Connection::open(path)?;
+        let store = Self {
+            conn: Arc::new(Mutex::new(conn)),
+        };
+        store.init_schema()?;
+        Ok(store)
+    }
+
+    fn init_schema(&self) -> AnyResult<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow!("sqlite mutex poisoned"))?;
+
+        conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS workers (
+                worker_id TEXT PRIMARY KEY,
+                multiaddr TEXT NOT NULL,
+                last_seen INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS shard_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_id TEXT NOT NULL,
+                segment_index INTEGER NOT NULL,
+                shard_index INTEGER NOT NULL,
+                worker_id TEXT NOT NULL,
+                worker_multiaddr TEXT NOT NULL,
+                shard_hash_hex TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_shards_file_id ON shard_records(file_id);
+
+            CREATE TABLE IF NOT EXISTS manifests (
+                file_id TEXT PRIMARY KEY,
+                signed_manifest_json TEXT NOT NULL
+            );
+            ",
+        )?;
+
+        Ok(())
+    }
+
+    fn load_workers(&self) -> AnyResult<Vec<WorkerInfo>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow!("sqlite mutex poisoned"))?;
+        let mut stmt = conn.prepare("SELECT worker_id, multiaddr, last_seen FROM workers")?;
+        let mut rows = stmt.query([])?;
+
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let last_seen: i64 = row.get(2)?;
+            out.push(WorkerInfo {
+                worker_id: row.get(0)?,
+                multiaddr: row.get(1)?,
+                last_seen: last_seen as u128,
+            });
+        }
+        Ok(out)
+    }
+
+    fn load_shards(&self) -> AnyResult<Vec<ShardRecord>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow!("sqlite mutex poisoned"))?;
+        let mut stmt = conn.prepare(
+            "
+            SELECT worker_id, worker_multiaddr, file_id, segment_index, shard_index, shard_hash_hex
+            FROM shard_records
+            ",
+        )?;
+        let mut rows = stmt.query([])?;
+
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let segment_index: i64 = row.get(3)?;
+            let shard_index: i64 = row.get(4)?;
+            out.push(ShardRecord {
+                worker_id: row.get(0)?,
+                worker_multiaddr: row.get(1)?,
+                file_id: row.get(2)?,
+                segment_index: segment_index as u32,
+                shard_index: shard_index as u8,
+                shard_hash_hex: row.get(5)?,
+            });
+        }
+        Ok(out)
+    }
+
+    fn load_manifests(&self) -> AnyResult<Vec<SignedManifest>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow!("sqlite mutex poisoned"))?;
+        let mut stmt = conn.prepare("SELECT signed_manifest_json FROM manifests")?;
+        let mut rows = stmt.query([])?;
+
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let json: String = row.get(0)?;
+            let manifest: SignedManifest = serde_json::from_str(&json)?;
+            out.push(manifest);
+        }
+        Ok(out)
+    }
+
+    fn upsert_worker(&self, worker: &WorkerInfo) -> AnyResult<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow!("sqlite mutex poisoned"))?;
+        conn.execute(
+            "
+            INSERT INTO workers(worker_id, multiaddr, last_seen)
+            VALUES(?1, ?2, ?3)
+            ON CONFLICT(worker_id) DO UPDATE SET
+              multiaddr = excluded.multiaddr,
+              last_seen = excluded.last_seen
+            ",
+            params![
+                worker.worker_id,
+                worker.multiaddr,
+                worker.last_seen as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn insert_shard(&self, rec: &ShardRecord) -> AnyResult<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow!("sqlite mutex poisoned"))?;
+        conn.execute(
+            "
+            INSERT INTO shard_records(
+              file_id, segment_index, shard_index, worker_id, worker_multiaddr, shard_hash_hex
+            ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)
+            ",
+            params![
+                rec.file_id,
+                rec.segment_index as i64,
+                rec.shard_index as i64,
+                rec.worker_id,
+                rec.worker_multiaddr,
+                rec.shard_hash_hex,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn upsert_manifest(&self, signed_manifest: &SignedManifest) -> AnyResult<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow!("sqlite mutex poisoned"))?;
+        let file_id = signed_manifest.manifest.file_id.clone();
+        let json = serde_json::to_string(signed_manifest)?;
+        conn.execute(
+            "
+            INSERT INTO manifests(file_id, signed_manifest_json)
+            VALUES(?1, ?2)
+            ON CONFLICT(file_id) DO UPDATE SET
+              signed_manifest_json = excluded.signed_manifest_json
+            ",
+            params![file_id, json],
+        )?;
+        Ok(())
+    }
+}
 
 #[derive(Clone)]
 struct AppState {
@@ -18,6 +214,8 @@ struct AppState {
     shard_index: Arc<DashMap<String, Vec<ShardRecord>>>,
     // file_id -> signed manifest
     manifest_index: Arc<DashMap<String, SignedManifest>>,
+    // sqlite-backed persistence
+    store: PersistentStore,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -39,17 +237,23 @@ fn now_ms() -> u128 {
         .as_millis()
 }
 
+fn to_internal_error(err: impl std::fmt::Display) -> (StatusCode, String) {
+    (StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+}
+
 async fn register_worker(
     state: axum::extract::State<AppState>,
     Json(req): Json<RegisterWorkerReq>,
-) -> Json<&'static str> {
+) -> Result<Json<&'static str>, (StatusCode, String)> {
     let worker = WorkerInfo {
         worker_id: req.worker_id.clone(),
         multiaddr: req.multiaddr,
         last_seen: now_ms(),
     };
+
+    state.store.upsert_worker(&worker).map_err(to_internal_error)?;
     state.workers.insert(req.worker_id, worker);
-    Json("ok")
+    Ok(Json("ok"))
 }
 
 async fn workers(state: axum::extract::State<AppState>) -> Json<Vec<WorkerInfo>> {
@@ -60,8 +264,15 @@ async fn workers(state: axum::extract::State<AppState>) -> Json<Vec<WorkerInfo>>
 async fn heartbeat(
     state: axum::extract::State<AppState>,
     Json(req): Json<HeartbeatReq>,
-) -> Json<&'static str> {
+) -> Result<Json<&'static str>, (StatusCode, String)> {
     let now = now_ms();
+    let worker = WorkerInfo {
+        worker_id: req.worker_id.clone(),
+        multiaddr: req.multiaddr.clone(),
+        last_seen: now,
+    };
+
+    state.store.upsert_worker(&worker).map_err(to_internal_error)?;
     state
         .workers
         .entry(req.worker_id.clone())
@@ -69,24 +280,25 @@ async fn heartbeat(
             w.last_seen = now;
             w.multiaddr = req.multiaddr.clone();
         })
-        .or_insert(WorkerInfo {
-            worker_id: req.worker_id,
-            multiaddr: req.multiaddr,
-            last_seen: now,
-        });
-    Json("ok")
+        .or_insert(worker);
+    Ok(Json("ok"))
 }
 
 async fn register_shard(
     state: axum::extract::State<AppState>,
     Json(req): Json<RegisterShardReq>,
-) -> Json<&'static str> {
+) -> Result<Json<&'static str>, (StatusCode, String)> {
+    state
+        .store
+        .insert_shard(&req.record)
+        .map_err(to_internal_error)?;
+
     state
         .shard_index
         .entry(req.record.file_id.clone())
         .and_modify(|v| v.push(req.record.clone()))
         .or_insert(vec![req.record]);
-    Json("ok")
+    Ok(Json("ok"))
 }
 
 async fn locate(
@@ -111,6 +323,11 @@ async fn register_manifest(
         .verify()
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid manifest signature: {e}")))?;
 
+    state
+        .store
+        .upsert_manifest(&req.signed_manifest)
+        .map_err(to_internal_error)?;
+
     let file_id = req.signed_manifest.manifest.file_id.clone();
     state.manifest_index.insert(file_id, req.signed_manifest);
     Ok(Json("ok"))
@@ -131,13 +348,53 @@ async fn get_manifest(
     }
 }
 
+fn load_state_from_store(store: &PersistentStore) -> AnyResult<AppState> {
+    let workers_loaded = store.load_workers()?;
+    let shards_loaded = store.load_shards()?;
+    let manifests_loaded = store.load_manifests()?;
+
+    let workers = Arc::new(DashMap::new());
+    for w in workers_loaded {
+        workers.insert(w.worker_id.clone(), w);
+    }
+
+    let shard_index: Arc<DashMap<String, Vec<ShardRecord>>> = Arc::new(DashMap::new());
+    for rec in shards_loaded {
+        shard_index
+            .entry(rec.file_id.clone())
+            .and_modify(|v| v.push(rec.clone()))
+            .or_insert(vec![rec]);
+    }
+
+    let manifest_index = Arc::new(DashMap::new());
+    for m in manifests_loaded {
+        manifest_index.insert(m.manifest.file_id.clone(), m);
+    }
+
+    Ok(AppState {
+        workers,
+        shard_index,
+        manifest_index,
+        store: store.clone(),
+    })
+}
+
 #[tokio::main]
-async fn main() {
-    let state = AppState {
-        workers: Arc::new(DashMap::new()),
-        shard_index: Arc::new(DashMap::new()),
-        manifest_index: Arc::new(DashMap::new()),
-    };
+async fn main() -> AnyResult<()> {
+    let store = PersistentStore::open_default()?;
+    let state = load_state_from_store(&store)?;
+
+    println!(
+        "Loaded persisted state: workers={} files_with_shards={} manifests={} db={}",
+        state.workers.len(),
+        state.shard_index.len(),
+        state.manifest_index.len(),
+        dirs::data_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("dsprout")
+            .join("satellite.sqlite3")
+            .display()
+    );
 
     let app = Router::new()
         .route("/register_worker", post(register_worker))
@@ -149,7 +406,8 @@ async fn main() {
         .route("/manifest", get(get_manifest))
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:7070").await.unwrap();
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:7070").await?;
     println!("Satellite running on http://localhost:7070");
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app).await?;
+    Ok(())
 }

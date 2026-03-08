@@ -12,7 +12,7 @@ use futures::StreamExt;
 use libp2p::{Multiaddr, PeerId, Swarm, request_response, swarm::SwarmEvent};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     env, fs,
     path::PathBuf,
     time::Duration,
@@ -22,7 +22,6 @@ const ROOT_SECRET: &[u8] = b"dsprout-dev-root-secret-v1";
 
 #[derive(Debug, Clone)]
 struct CommonArgs {
-    dial: Multiaddr,
     satellite_url: String,
     swarm_key: Option<PathBuf>,
 }
@@ -32,6 +31,7 @@ struct UploadArgs {
     common: CommonArgs,
     input: PathBuf,
     file_id: Option<String>,
+    workers: Vec<Multiaddr>,
 }
 
 #[derive(Debug, Clone)]
@@ -64,8 +64,16 @@ struct UploadManifest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct WorkerInfo {
+    worker_id: String,
+    multiaddr: String,
+    last_seen: u128,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ShardRecord {
     worker_id: String,
+    worker_multiaddr: String,
     file_id: String,
     segment_index: u32,
     shard_index: u8,
@@ -122,6 +130,12 @@ impl SatelliteClient {
         let res = res.error_for_status()?;
         Ok(res.json::<LocateResp>().await?)
     }
+
+    async fn workers(&self) -> Result<Vec<WorkerInfo>> {
+        let res = self.http.get(self.endpoint("/workers")).send().await?;
+        let res = res.error_for_status()?;
+        Ok(res.json::<Vec<WorkerInfo>>().await?)
+    }
 }
 
 struct ControlClient {
@@ -140,6 +154,10 @@ impl ControlClient {
     fn target_peer(&self) -> Result<PeerId> {
         self.target_peer
             .ok_or_else(|| anyhow::anyhow!("not connected to worker"))
+    }
+
+    fn local_peer_id(&self) -> PeerId {
+        *self.swarm.local_peer_id()
     }
 
     async fn connect(&mut self, dial: Multiaddr) -> Result<PeerId> {
@@ -215,6 +233,13 @@ impl ControlClient {
     }
 }
 
+struct WorkerConnection {
+    worker_id: String,
+    multiaddr: Multiaddr,
+    client: ControlClient,
+    online: bool,
+}
+
 fn parse_command() -> Result<Command> {
     let mut args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() {
@@ -224,24 +249,17 @@ fn parse_command() -> Result<Command> {
     }
 
     let subcommand = args.remove(0);
-    let mut dial: Option<Multiaddr> = None;
     let mut satellite_url: String = "http://127.0.0.1:7070".to_string();
     let mut swarm_key: Option<PathBuf> = None;
 
     let mut input: Option<PathBuf> = None;
     let mut output: Option<PathBuf> = None;
     let mut file_id: Option<String> = None;
+    let mut workers: Vec<Multiaddr> = Vec::new();
 
     let mut i = 0usize;
     while i < args.len() {
         match args[i].as_str() {
-            "--dial" => {
-                i += 1;
-                let v = args
-                    .get(i)
-                    .ok_or_else(|| anyhow::anyhow!("missing value for --dial"))?;
-                dial = Some(v.parse()?);
-            }
             "--satellite-url" => {
                 i += 1;
                 satellite_url = args
@@ -278,6 +296,13 @@ fn parse_command() -> Result<Command> {
                         .clone(),
                 );
             }
+            "--worker" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("missing value for --worker"))?;
+                workers.push(v.parse()?);
+            }
             unknown => {
                 return Err(anyhow::anyhow!("unknown argument: {unknown}"));
             }
@@ -285,9 +310,7 @@ fn parse_command() -> Result<Command> {
         i += 1;
     }
 
-    let dial = dial.ok_or_else(|| anyhow::anyhow!("--dial is required"))?;
     let common = CommonArgs {
-        dial,
         satellite_url,
         swarm_key,
     };
@@ -297,6 +320,7 @@ fn parse_command() -> Result<Command> {
             common,
             input: input.ok_or_else(|| anyhow::anyhow!("--input is required for upload"))?,
             file_id,
+            workers,
         })),
         "download" => Ok(Command::Download(DownloadArgs {
             common,
@@ -335,32 +359,85 @@ fn create_file_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
-async fn run_upload(args: UploadArgs) -> Result<()> {
-    let swarm_key = args
-        .common
+async fn connect_worker(common: &CommonArgs, multiaddr: Multiaddr) -> Result<WorkerConnection> {
+    let swarm_key = common
         .swarm_key
+        .clone()
         .unwrap_or_else(|| dsprout_common::net::default_swarm_key_path(env!("CARGO_MANIFEST_DIR")));
-
     let mut client = ControlClient::new(build_swarm(&swarm_key, "uplink")?);
-    let worker_peer = client.connect(args.common.dial).await?;
+    let worker_id = client.connect(multiaddr.clone()).await?.to_string();
 
-    let satellite = SatelliteClient::new(args.common.satellite_url);
+    match client
+        .request(NetRequest::Hello {
+            from_peer: client.local_peer_id().to_string(),
+            message: "hello-upload-download".to_string(),
+        })
+        .await?
+    {
+        NetResponse::HelloAck { .. } => {}
+        other => {
+            return Err(anyhow::anyhow!("unexpected hello response: {other:?}"));
+        }
+    }
+
+    Ok(WorkerConnection {
+        worker_id,
+        multiaddr,
+        client,
+        online: true,
+    })
+}
+
+async fn resolve_upload_workers(
+    common: &CommonArgs,
+    satellite: &SatelliteClient,
+    explicit: &[Multiaddr],
+) -> Result<Vec<WorkerConnection>> {
+    let worker_addrs: Vec<Multiaddr> = if explicit.is_empty() {
+        let mut addrs = Vec::new();
+        for w in satellite.workers().await? {
+            if let Ok(addr) = w.multiaddr.parse() {
+                addrs.push(addr);
+            }
+        }
+        addrs
+    } else {
+        explicit.to_vec()
+    };
+
+    if worker_addrs.is_empty() {
+        return Err(anyhow::anyhow!(
+            "no workers provided and /workers returned none"
+        ));
+    }
+
+    let mut out = Vec::new();
+    for addr in worker_addrs {
+        match connect_worker(common, addr.clone()).await {
+            Ok(conn) => out.push(conn),
+            Err(err) => {
+                eprintln!("warning: failed to connect worker {addr}: {err}");
+            }
+        }
+    }
+
+    if out.is_empty() {
+        return Err(anyhow::anyhow!("failed to connect to any worker"));
+    }
+
+    Ok(out)
+}
+
+async fn run_upload(args: UploadArgs) -> Result<()> {
+    let satellite = SatelliteClient::new(args.common.satellite_url.clone());
+    let mut workers = resolve_upload_workers(&args.common, &satellite, &args.workers).await?;
 
     let input_bytes = fs::read(&args.input)?;
     let file_id = args.file_id.unwrap_or_else(create_file_id);
     let original_hash_hex = hash::blake3_hash_hex(&input_bytes);
 
-    if let NetResponse::Error { message } = client
-        .request(NetRequest::Hello {
-            from_peer: client.swarm.local_peer_id().to_string(),
-            message: "hello-upload".to_string(),
-        })
-        .await?
-    {
-        return Err(anyhow::anyhow!("hello failed: {message}"));
-    }
-
     let mut segments = Vec::new();
+    let mut rr = 0usize;
 
     for (segment_index, chunk) in input_bytes.chunks(SEGMENT_SIZE).enumerate() {
         let segment_index = segment_index as u32;
@@ -371,7 +448,12 @@ async fn run_upload(args: UploadArgs) -> Result<()> {
         let shards = sharding::rs_encode(&ciphertext)?;
         for (shard_index, shard_bytes) in shards.into_iter().enumerate() {
             let shard_index = shard_index as u8;
-            match client
+            let idx = rr % workers.len();
+            rr += 1;
+
+            let worker = &mut workers[idx];
+            match worker
+                .client
                 .request(NetRequest::StoreShard {
                     file_id: file_id.clone(),
                     segment_index,
@@ -383,23 +465,24 @@ async fn run_upload(args: UploadArgs) -> Result<()> {
                 NetResponse::StoreShardAck { stored: true, .. } => {}
                 NetResponse::StoreShardAck { stored: false, .. } => {
                     return Err(anyhow::anyhow!(
-                        "worker reported stored=false for shard {shard_index}"
+                        "worker {} reported stored=false for shard {shard_index}",
+                        worker.worker_id
                     ));
                 }
                 NetResponse::Error { message } => {
-                    return Err(anyhow::anyhow!("store shard error: {message}"));
-                }
-                other => {
                     return Err(anyhow::anyhow!(
-                        "unexpected store shard response: {other:?}"
+                        "store shard error on worker {}: {message}",
+                        worker.worker_id
                     ));
                 }
+                other => return Err(anyhow::anyhow!("unexpected store response: {other:?}")),
             }
 
             let shard_hash_hex = hash::blake3_hash_hex(&shard_bytes);
             satellite
                 .register_shard(ShardRecord {
-                    worker_id: worker_peer.to_string(),
+                    worker_id: worker.worker_id.clone(),
+                    worker_multiaddr: worker.multiaddr.to_string(),
                     file_id: file_id.clone(),
                     segment_index,
                     shard_index,
@@ -426,7 +509,7 @@ async fn run_upload(args: UploadArgs) -> Result<()> {
 
     println!("Upload complete");
     println!("file_id={file_id}");
-    println!("worker_peer={worker_peer}");
+    println!("workers_connected={}", workers.len());
     println!("manifest={}", manifest_path.display());
     println!("segments={}", manifest.segments.len());
 
@@ -434,34 +517,41 @@ async fn run_upload(args: UploadArgs) -> Result<()> {
 }
 
 async fn run_download(args: DownloadArgs) -> Result<()> {
-    let swarm_key = args
-        .common
-        .swarm_key
-        .unwrap_or_else(|| dsprout_common::net::default_swarm_key_path(env!("CARGO_MANIFEST_DIR")));
-
-    let mut client = ControlClient::new(build_swarm(&swarm_key, "uplink")?);
-    let worker_peer = client.connect(args.common.dial).await?;
-
     let manifest = load_manifest(&args.file_id)?;
-    let satellite = SatelliteClient::new(args.common.satellite_url);
+    let satellite = SatelliteClient::new(args.common.satellite_url.clone());
     let locate = satellite.locate(&args.file_id).await?;
 
-    if let NetResponse::Error { message } = client
-        .request(NetRequest::Hello {
-            from_peer: client.swarm.local_peer_id().to_string(),
-            message: "hello-download".to_string(),
-        })
-        .await?
-    {
-        return Err(anyhow::anyhow!("hello failed: {message}"));
+    if locate.shards.is_empty() {
+        return Err(anyhow::anyhow!("satellite returned no shards for file"));
+    }
+
+    let mut worker_addr_by_id: HashMap<String, Multiaddr> = HashMap::new();
+    for rec in &locate.shards {
+        if let Ok(addr) = rec.worker_multiaddr.parse() {
+            worker_addr_by_id
+                .entry(rec.worker_id.clone())
+                .or_insert(addr);
+        }
+    }
+
+    let mut workers: HashMap<String, WorkerConnection> = HashMap::new();
+    for (worker_id, addr) in worker_addr_by_id {
+        match connect_worker(&args.common, addr.clone()).await {
+            Ok(conn) => {
+                workers.insert(worker_id, conn);
+            }
+            Err(err) => {
+                eprintln!("warning: worker {worker_id} offline/unreachable ({addr}): {err}");
+            }
+        }
     }
 
     let mut shard_map_by_segment: HashMap<u32, Vec<ShardRecord>> = HashMap::new();
-    for record in locate.shards {
+    for rec in locate.shards {
         shard_map_by_segment
-            .entry(record.segment_index)
+            .entry(rec.segment_index)
             .or_default()
-            .push(record);
+            .push(rec);
     }
 
     let mut restored = Vec::new();
@@ -469,82 +559,141 @@ async fn run_download(args: DownloadArgs) -> Result<()> {
     for segment in &manifest.segments {
         let seg_records = shard_map_by_segment
             .get(&segment.segment_index)
-            .ok_or_else(|| {
-                anyhow::anyhow!("no shard records for segment {}", segment.segment_index)
-            })?;
+            .ok_or_else(|| anyhow::anyhow!("no records for segment {}", segment.segment_index))?;
 
-        let mut unique: BTreeMap<u8, &ShardRecord> = BTreeMap::new();
+        let mut available_workers: HashSet<String> = HashSet::new();
         for rec in seg_records {
-            unique.entry(rec.shard_index).or_insert(rec);
+            if workers.contains_key(&rec.worker_id) {
+                available_workers.insert(rec.worker_id.clone());
+            }
         }
-
-        if unique.len() < RS_K {
+        if available_workers.is_empty() {
             return Err(anyhow::anyhow!(
-                "segment {} has only {} shard records, need at least {}",
-                segment.segment_index,
-                unique.len(),
-                RS_K
+                "no online workers for segment {}",
+                segment.segment_index
             ));
         }
 
-        let selected_indices: Vec<u8> = unique.keys().copied().take(RS_K).collect();
-
-        match client
-            .request(NetRequest::Prepare {
-                file_id: args.file_id.clone(),
-                segment_index: segment.segment_index,
-                shard_indices: selected_indices.clone(),
-            })
-            .await?
-        {
-            NetResponse::PrepareAck { .. } => {}
-            NetResponse::Error { message } => {
-                return Err(anyhow::anyhow!("prepare failed: {message}"));
+        let mut per_worker_prepare: HashMap<String, Vec<u8>> = HashMap::new();
+        for rec in seg_records {
+            if workers.contains_key(&rec.worker_id) {
+                per_worker_prepare
+                    .entry(rec.worker_id.clone())
+                    .or_default()
+                    .push(rec.shard_index);
             }
-            other => return Err(anyhow::anyhow!("unexpected prepare response: {other:?}")),
+        }
+
+        for (worker_id, indices) in per_worker_prepare {
+            if let Some(conn) = workers.get_mut(&worker_id) {
+                let mut uniq = indices;
+                uniq.sort_unstable();
+                uniq.dedup();
+                match conn
+                    .client
+                    .request(NetRequest::Prepare {
+                        file_id: args.file_id.clone(),
+                        segment_index: segment.segment_index,
+                        shard_indices: uniq,
+                    })
+                    .await
+                {
+                    Ok(NetResponse::PrepareAck { .. }) => {}
+                    Ok(other) => {
+                        eprintln!("warning: prepare unexpected for worker {worker_id}: {other:?}");
+                        conn.online = false;
+                    }
+                    Err(err) => {
+                        eprintln!("warning: prepare failed for worker {worker_id}: {err}");
+                        conn.online = false;
+                    }
+                }
+            }
         }
 
         let mut shard_options: Vec<Option<Vec<u8>>> = vec![None; RS_N];
-        for shard_index in selected_indices {
-            match client
-                .request(NetRequest::VerifyGet {
-                    file_id: args.file_id.clone(),
-                    segment_index: segment.segment_index,
-                    shard_index,
-                })
-                .await?
-            {
-                NetResponse::VerifyGetOk {
-                    shard_index: got_index,
-                    bytes,
-                    source: _,
-                    ..
-                } => {
-                    if got_index != shard_index {
-                        return Err(anyhow::anyhow!(
-                            "verify_get mismatch: requested {shard_index}, got {got_index}"
-                        ));
-                    }
+        let mut used_shards = 0usize;
 
-                    let expected = unique.get(&shard_index).ok_or_else(|| {
-                        anyhow::anyhow!("missing expected record for shard {shard_index}")
-                    })?;
-                    let actual_hash = hash::blake3_hash_hex(&bytes);
-                    if actual_hash != expected.shard_hash_hex {
-                        return Err(anyhow::anyhow!(
-                            "hash mismatch for segment {} shard {}",
-                            segment.segment_index,
-                            shard_index
-                        ));
-                    }
+        let mut unique_by_index: BTreeMap<u8, Vec<&ShardRecord>> = BTreeMap::new();
+        for rec in seg_records {
+            unique_by_index
+                .entry(rec.shard_index)
+                .or_default()
+                .push(rec);
+        }
 
-                    shard_options[shard_index as usize] = Some(bytes);
-                }
-                NetResponse::Error { message } => {
-                    return Err(anyhow::anyhow!("verify_get failed: {message}"));
-                }
-                other => return Err(anyhow::anyhow!("unexpected verify_get response: {other:?}")),
+        for (shard_index, candidates) in unique_by_index {
+            if used_shards >= RS_K {
+                break;
             }
+
+            let mut success = false;
+            for rec in candidates {
+                let Some(conn) = workers.get_mut(&rec.worker_id) else {
+                    continue;
+                };
+                if !conn.online {
+                    continue;
+                }
+
+                match conn
+                    .client
+                    .request(NetRequest::VerifyGet {
+                        file_id: args.file_id.clone(),
+                        segment_index: segment.segment_index,
+                        shard_index,
+                    })
+                    .await
+                {
+                    Ok(NetResponse::VerifyGetOk { bytes, .. }) => {
+                        let actual_hash = hash::blake3_hash_hex(&bytes);
+                        if actual_hash != rec.shard_hash_hex {
+                            eprintln!(
+                                "warning: hash mismatch segment {} shard {} from worker {}",
+                                segment.segment_index, shard_index, rec.worker_id
+                            );
+                            continue;
+                        }
+
+                        shard_options[shard_index as usize] = Some(bytes);
+                        used_shards += 1;
+                        success = true;
+                        break;
+                    }
+                    Ok(NetResponse::Error { message }) => {
+                        eprintln!(
+                            "warning: verify_get error segment {} shard {} from worker {}: {}",
+                            segment.segment_index, shard_index, rec.worker_id, message
+                        );
+                    }
+                    Ok(other) => {
+                        eprintln!(
+                            "warning: unexpected verify_get response from worker {}: {other:?}",
+                            rec.worker_id
+                        );
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "warning: worker {} went offline while fetching shard {}: {}",
+                            rec.worker_id, shard_index, err
+                        );
+                        conn.online = false;
+                    }
+                }
+            }
+
+            if !success {
+                continue;
+            }
+        }
+
+        if used_shards < RS_K {
+            return Err(anyhow::anyhow!(
+                "segment {} only recovered {} shards, need {}",
+                segment.segment_index,
+                used_shards,
+                RS_K
+            ));
         }
 
         let encrypted = sharding::rs_reconstruct(shard_options, segment.ciphertext_len)?;
@@ -565,7 +714,10 @@ async fn run_download(args: DownloadArgs) -> Result<()> {
 
     println!("Download complete");
     println!("file_id={}", manifest.file_id);
-    println!("worker_peer={worker_peer}");
+    println!(
+        "workers_online={}",
+        workers.values().filter(|w| w.online).count()
+    );
     println!("original_hash={}", manifest.original_hash_hex);
     println!("restored_hash={restored_hash_hex}");
     println!("equal={equal}");

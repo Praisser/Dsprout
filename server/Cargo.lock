@@ -684,6 +684,8 @@ dependencies = [
  "dsprout-common",
  "futures",
  "libp2p",
+ "reqwest",
+ "serde",
  "tokio",
 ]
 

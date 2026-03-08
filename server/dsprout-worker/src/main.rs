@@ -10,7 +10,21 @@ use dsprout_common::{
 };
 use futures::StreamExt;
 use libp2p::{Multiaddr, request_response, swarm::SwarmEvent};
+use serde::Serialize;
 use std::env;
+
+#[derive(Debug, Clone)]
+struct RunArgs {
+    profile: String,
+    listen: Multiaddr,
+    satellite_url: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct WorkerRegistration {
+    worker_id: String,
+    multiaddr: String,
+}
 
 fn decode_hex(s: &str) -> Result<Vec<u8>> {
     let s = s.trim();
@@ -88,6 +102,59 @@ fn parse_seed_args(args: &[String]) -> Result<(String, u32, u8, Vec<u8>)> {
     Ok((file_id, segment, shard, data))
 }
 
+fn parse_run_args(args: &[String]) -> Result<RunArgs> {
+    let mut profile = "worker".to_string();
+    let mut listen: Multiaddr = "/ip4/0.0.0.0/tcp/4001".parse()?;
+    let mut satellite_url = "http://127.0.0.1:7070".to_string();
+
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--profile" => {
+                i += 1;
+                profile = args
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("missing value for --profile"))?
+                    .clone();
+            }
+            "--listen" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("missing value for --listen"))?;
+                listen = v.parse()?;
+            }
+            "--satellite-url" => {
+                i += 1;
+                satellite_url = args
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("missing value for --satellite-url"))?
+                    .clone();
+            }
+            unknown => return Err(anyhow::anyhow!("unknown argument: {unknown}")),
+        }
+        i += 1;
+    }
+
+    Ok(RunArgs {
+        profile,
+        listen,
+        satellite_url,
+    })
+}
+
+async fn post_json(url: &str, path: &str, payload: &impl Serialize) {
+    let endpoint = format!(
+        "{}/{}",
+        url.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    );
+    let client = reqwest::Client::new();
+    if let Err(err) = client.post(endpoint).json(payload).send().await {
+        eprintln!("satellite call failed: {err}");
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -104,16 +171,34 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    let run = parse_run_args(&args)?;
     let hot_cache = store::HotCache::new();
 
     let swarm_key = dsprout_common::net::default_swarm_key_path(env!("CARGO_MANIFEST_DIR"));
-    let mut swarm = build_swarm(&swarm_key, "worker")?;
+    let mut swarm = build_swarm(&swarm_key, &run.profile)?;
 
-    let listen_addr: Multiaddr = "/ip4/0.0.0.0/tcp/4001".parse()?;
-    swarm.listen_on(listen_addr.clone())?;
+    swarm.listen_on(run.listen.clone())?;
 
-    println!("Worker peer id: {}", swarm.local_peer_id());
-    println!("Worker listening on: {listen_addr}");
+    let worker_id = swarm.local_peer_id().to_string();
+    println!("Worker peer id: {worker_id}");
+    println!("Worker profile: {}", run.profile);
+    println!("Worker listening on: {}", run.listen);
+
+    let reg = WorkerRegistration {
+        worker_id: worker_id.clone(),
+        multiaddr: run.listen.to_string(),
+    };
+    post_json(&run.satellite_url, "/register_worker", &reg).await;
+
+    let satellite_url = run.satellite_url.clone();
+    let heartbeat_payload = reg.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(10));
+        loop {
+            ticker.tick().await;
+            post_json(&satellite_url, "/heartbeat", &heartbeat_payload).await;
+        }
+    });
 
     loop {
         match swarm.select_next_some().await {

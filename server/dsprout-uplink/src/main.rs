@@ -35,6 +35,7 @@ struct UploadArgs {
     input: PathBuf,
     file_id: Option<String>,
     workers: Vec<Multiaddr>,
+    replication_factor: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -240,6 +241,7 @@ fn parse_command() -> Result<Command> {
     let mut output: Option<PathBuf> = None;
     let mut file_id: Option<String> = None;
     let mut workers: Vec<Multiaddr> = Vec::new();
+    let mut replication_factor: usize = 2;
 
     let mut i = 0usize;
     while i < args.len() {
@@ -287,6 +289,15 @@ fn parse_command() -> Result<Command> {
                     .ok_or_else(|| anyhow::anyhow!("missing value for --worker"))?;
                 workers.push(v.parse()?);
             }
+            "--replication-factor" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("missing value for --replication-factor"))?;
+                replication_factor = v.parse::<usize>().map_err(|e| {
+                    anyhow::anyhow!("invalid value for --replication-factor ({v}): {e}")
+                })?;
+            }
             unknown => {
                 return Err(anyhow::anyhow!("unknown argument: {unknown}"));
             }
@@ -305,6 +316,7 @@ fn parse_command() -> Result<Command> {
             input: input.ok_or_else(|| anyhow::anyhow!("--input is required for upload"))?,
             file_id,
             workers,
+            replication_factor,
         })),
         "download" => Ok(Command::Download(DownloadArgs {
             common,
@@ -415,6 +427,18 @@ async fn resolve_upload_workers(
 async fn run_upload(args: UploadArgs) -> Result<()> {
     let satellite = SatelliteClient::new(args.common.satellite_url.clone());
     let mut workers = resolve_upload_workers(&args.common, &satellite, &args.workers).await?;
+    if args.replication_factor == 0 {
+        return Err(anyhow::anyhow!(
+            "--replication-factor must be >= 1 for upload"
+        ));
+    }
+    if args.replication_factor > workers.len() {
+        return Err(anyhow::anyhow!(
+            "replication factor {} exceeds connected workers {}",
+            args.replication_factor,
+            workers.len()
+        ));
+    }
 
     let input_bytes = fs::read(&args.input)?;
     let file_id = args.file_id.unwrap_or_else(create_file_id);
@@ -432,47 +456,54 @@ async fn run_upload(args: UploadArgs) -> Result<()> {
         let shards = sharding::rs_encode(&ciphertext)?;
         for (shard_index, shard_bytes) in shards.into_iter().enumerate() {
             let shard_index = shard_index as u8;
-            let idx = rr % workers.len();
+            let base_idx = rr % workers.len();
             rr += 1;
 
-            let worker = &mut workers[idx];
-            match worker
-                .client
-                .request(NetRequest::StoreShard {
-                    file_id: file_id.clone(),
-                    segment_index,
-                    shard_index,
-                    bytes: shard_bytes.clone(),
-                })
-                .await?
-            {
-                NetResponse::StoreShardAck { stored: true, .. } => {}
-                NetResponse::StoreShardAck { stored: false, .. } => {
-                    return Err(anyhow::anyhow!(
-                        "worker {} reported stored=false for shard {shard_index}",
-                        worker.worker_id
-                    ));
-                }
-                NetResponse::Error { message } => {
-                    return Err(anyhow::anyhow!(
-                        "store shard error on worker {}: {message}",
-                        worker.worker_id
-                    ));
-                }
-                other => return Err(anyhow::anyhow!("unexpected store response: {other:?}")),
-            }
-
             let shard_hash_hex = hash::blake3_hash_hex(&shard_bytes);
-            satellite
-                .register_shard(ShardRecord {
-                    worker_id: worker.worker_id.clone(),
-                    worker_multiaddr: worker.multiaddr.to_string(),
-                    file_id: file_id.clone(),
-                    segment_index,
-                    shard_index,
-                    shard_hash_hex,
-                })
-                .await?;
+            for replica_offset in 0..args.replication_factor {
+                let idx = (base_idx + replica_offset) % workers.len();
+                let worker = &mut workers[idx];
+                match worker
+                    .client
+                    .request(NetRequest::StoreShard {
+                        file_id: file_id.clone(),
+                        segment_index,
+                        shard_index,
+                        bytes: shard_bytes.clone(),
+                    })
+                    .await?
+                {
+                    NetResponse::StoreShardAck { stored: true, .. } => {}
+                    NetResponse::StoreShardAck { stored: false, .. } => {
+                        return Err(anyhow::anyhow!(
+                            "worker {} reported stored=false for shard {shard_index} replica {}",
+                            worker.worker_id,
+                            replica_offset
+                        ));
+                    }
+                    NetResponse::Error { message } => {
+                        return Err(anyhow::anyhow!(
+                            "store shard error on worker {} replica {}: {message}",
+                            worker.worker_id,
+                            replica_offset
+                        ));
+                    }
+                    other => {
+                        return Err(anyhow::anyhow!("unexpected store response: {other:?}"));
+                    }
+                }
+
+                satellite
+                    .register_shard(ShardRecord {
+                        worker_id: worker.worker_id.clone(),
+                        worker_multiaddr: worker.multiaddr.to_string(),
+                        file_id: file_id.clone(),
+                        segment_index,
+                        shard_index,
+                        shard_hash_hex: shard_hash_hex.clone(),
+                    })
+                    .await?;
+            }
         }
 
         segments.push(ManifestSegment {
@@ -497,6 +528,7 @@ async fn run_upload(args: UploadArgs) -> Result<()> {
     println!("Upload complete");
     println!("file_id={file_id}");
     println!("workers_connected={}", workers.len());
+    println!("replication_factor={}", args.replication_factor);
     println!("manifest={}", manifest_path.display());
     println!("segments={}", signed_manifest.manifest.segments.len());
     println!("manifest_registered=true");

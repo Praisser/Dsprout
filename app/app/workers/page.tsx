@@ -28,6 +28,9 @@ export default async function WorkersPage() {
         <Link className="underline" href="/contributors">
           Contributor Registration
         </Link>
+        <Link className="underline" href="/agent">
+          Worker Control Panel
+        </Link>
       </div>
 
       <div className="mt-5 overflow-auto border rounded">

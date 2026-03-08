@@ -25,6 +25,11 @@ export default function Home() {
             </Link>
           </li>
           <li>
+            <Link className="underline" href="/agent">
+              Worker Control Panel
+            </Link>
+          </li>
+          <li>
             <Link className="underline" href="/files">
               File Lookup
             </Link>

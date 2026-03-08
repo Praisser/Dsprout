@@ -47,6 +47,9 @@ export default async function ContributorsPage({ searchParams }: ContributorsPag
         <Link className="underline" href="/workers">
           Worker List
         </Link>
+        <Link className="underline" href="/agent">
+          Worker Control Panel
+        </Link>
       </div>
 
       {params.ok ? <p className="mt-4 text-sm text-green-700">Worker metadata registered.</p> : null}

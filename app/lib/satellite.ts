@@ -93,8 +93,37 @@ export type RepairApiResp = {
   new_replicas: number;
 };
 
+export type WorkerAgentConfig = {
+  profile: string;
+  listen_multiaddr: string;
+  satellite_url: string;
+  device_name: string;
+  owner_label: string;
+  capacity_limit_bytes: number;
+  enabled: boolean;
+};
+
+export type WorkerAgentStatusResp = {
+  running: boolean;
+  pid: number | null;
+  started_at_ms: number | null;
+  last_exit_code: number | null;
+  last_error: string | null;
+  config: WorkerAgentConfig;
+};
+
+export type WorkerAgentStorageResp = {
+  profile: string;
+  used_bytes: number;
+  hosted_shards: number;
+};
+
 export function satelliteBaseUrl(): string {
   return process.env.SATELLITE_URL?.trim() || "http://127.0.0.1:7070";
+}
+
+export function localAgentBaseUrl(): string {
+  return process.env.LOCAL_AGENT_URL?.trim() || "http://127.0.0.1:7081";
 }
 
 export async function fetchJson<T>(url: string): Promise<T> {

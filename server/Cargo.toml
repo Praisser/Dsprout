@@ -4,5 +4,6 @@ members = [
   "dsprout-satellite",
   "dsprout-worker",
   "dsprout-uplink",
+  "dsprout-agent",
 ]
 resolver = "2"

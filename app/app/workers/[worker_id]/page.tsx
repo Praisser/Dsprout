@@ -33,6 +33,9 @@ export default async function WorkerDetailPage({ params }: WorkerDetailPageProps
         <Link className="underline" href="/contributors">
           Contributor Registration
         </Link>
+        <Link className="underline" href="/agent">
+          Worker Control Panel
+        </Link>
       </div>
 
       <div className="mt-6 space-y-2 text-sm">

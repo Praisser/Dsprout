@@ -1,11 +1,11 @@
 # PROJECT_STATE
 
-Last updated after Milestone 14.
+Last updated after Milestone 15.
 
 ## current architecture
 
 - Monorepo root:
-- `app/` (Next.js contributor + file operations dashboard)
+- `app/` (Next.js contributor + file operations + worker control dashboard)
 - `server/` (Rust backend workspace)
 
 - Backend crates:
@@ -16,36 +16,65 @@ Last updated after Milestone 14.
 - `server/dsprout-uplink`:
 - upload/download/repair core logic (terminal engine still source of truth).
 - `server/dsprout-satellite`:
-- registry/index + persistence service with SQLite; now also exposes thin HTTP file action APIs that invoke uplink logic.
+- registry/index + persistence service with SQLite and thin HTTP upload/download/repair file actions.
+- `server/dsprout-agent`:
+- local-first worker agent that manages `dsprout-worker` process lifecycle and exposes local control/status/storage endpoints.
 
 - Frontend:
 - workers list/detail + contributor registration (Milestone 12)
 - file lookup/detail + upload form + download form (Milestone 13)
 - file health dashboard metrics + repair controls on file detail page (Milestone 14)
+- local worker control panel for start/stop/config/storage (Milestone 15)
 
 ## files changed
 
-- `app/lib/satellite.ts`
-- Added typed repair API request/response models:
-- `RepairApiReq`
-- `RepairApiResp`
+- `server/Cargo.toml`
+- Added new workspace member: `dsprout-agent`.
 
-- `app/app/files/page.tsx`
-- Extended file detail view to show:
-- manifest summary
-- shard record count
-- unique shard count
-- replica min/max/avg
-- worker placement summary
-- health status (`healthy` / `degraded` / `under-replicated`)
-- Added repair control form with server action calling `POST /repair`.
-- Added repair result messages showing:
-- `repaired_shards`
-- `new_replicas`
-- Added post-repair redirect back to `/files?file_id=...` so health data is refreshed immediately.
+- `server/dsprout-agent/Cargo.toml`
+- New crate manifest for local worker agent service.
+
+- `server/dsprout-agent/src/main.rs`
+- Added local worker agent HTTP service with endpoints:
+- `GET /status`
+- `POST /start`
+- `POST /stop`
+- `POST /config`
+- `GET /storage`
+- Reuses existing `dsprout-worker` binary via child-process control (no worker logic rewrite).
+- Persists local config to data dir (`agent-config.json`).
+- Computes local storage summary (`used_bytes`, `hosted_shards`) from worker store files.
+
+- `app/lib/satellite.ts`
+- Added local agent base URL helper:
+- `localAgentBaseUrl()` (defaults to `http://127.0.0.1:7081`)
+- Added agent response/config types for UI integration.
+
+- `app/app/agent/page.tsx`
+- New contributor worker control panel page:
+- show worker status
+- start/stop worker
+- update device name
+- update capacity limit bytes
+- show used bytes + hosted shard count
+
+- `app/app/page.tsx`
+- Added nav link to Worker Control Panel (`/agent`).
+
+- `app/app/contributors/page.tsx`
+- Added nav link to Worker Control Panel (`/agent`).
+
+- `app/app/workers/page.tsx`
+- Added nav link to Worker Control Panel (`/agent`).
+
+- `app/app/workers/[worker_id]/page.tsx`
+- Added nav link to Worker Control Panel (`/agent`).
+
+- `server/Cargo.lock`
+- Updated lockfile for new `dsprout-agent` crate dependencies.
 
 - `PROJECT_STATE.md`
-- Updated for Milestone 14.
+- Updated for Milestone 15.
 
 ## commands to run
 
@@ -55,65 +84,77 @@ All commands below are from repository root (`dsprout`).
 
 ```bash
 cd server
-cargo build -p dsprout-common -p dsprout-satellite -p dsprout-worker -p dsprout-uplink
+cargo build -p dsprout-common -p dsprout-satellite -p dsprout-worker -p dsprout-uplink -p dsprout-agent
 ```
 
-### 2) Start backend
+### 2) Start backend services
 
 ```bash
 cd server
 cargo run -p dsprout-satellite
-cargo run -p dsprout-worker -- --profile w1 --listen /ip4/127.0.0.1/tcp/5901 --satellite-url http://127.0.0.1:7070 --device-name "W1" --owner-label "Contributor" --capacity-limit-bytes 1073741824 --enabled true
-cargo run -p dsprout-worker -- --profile w2 --listen /ip4/127.0.0.1/tcp/5902 --satellite-url http://127.0.0.1:7070 --device-name "W2" --owner-label "Contributor" --capacity-limit-bytes 1073741824 --enabled true
+cargo run -p dsprout-agent
 ```
+
+Notes:
+- `dsprout-agent` listens on `http://127.0.0.1:7081` by default.
+- To override worker binary path for agent-managed start/stop, set `DSPROUT_WORKER_BIN`.
 
 ### 3) Run frontend
 
 ```bash
 cd app
 npm install
-SATELLITE_URL=http://127.0.0.1:7070 npm run dev
+SATELLITE_URL=http://127.0.0.1:7070 LOCAL_AGENT_URL=http://127.0.0.1:7081 npm run dev
 ```
 
 Open: `http://localhost:3000`
 
-### 4) Milestone 14 direct API checks
+### 4) Milestone 15 direct API checks
 
 ```bash
-# upload
-curl -s -X POST http://127.0.0.1:7070/upload \
-  -H 'content-type: application/json' \
-  -d '{"file_bytes_base64":"<BASE64_BYTES>","replication_factor":2}'
+# agent status
+curl -s http://127.0.0.1:7081/status
 
-# download
-curl -s -X POST http://127.0.0.1:7070/download \
-  -H 'content-type: application/json' \
-  -d '{"file_id":"<FILE_ID>"}'
+# agent storage summary
+curl -s http://127.0.0.1:7081/storage
 
-# repair
-curl -s -X POST http://127.0.0.1:7070/repair \
+# start worker (agent-managed)
+curl -s -X POST http://127.0.0.1:7081/start \
   -H 'content-type: application/json' \
-  -d '{"file_id":"<FILE_ID>","replication_factor":2}'
+  -d '{}'
+
+# update worker config
+curl -s -X POST http://127.0.0.1:7081/config \
+  -H 'content-type: application/json' \
+  -d '{"device_name":"Contributor Laptop","capacity_limit_bytes":2147483648,"restart_if_running":true}'
+
+# stop worker (agent-managed)
+curl -s -X POST http://127.0.0.1:7081/stop \
+  -H 'content-type: application/json' \
+  -d '{}'
 ```
 
 ## validations passed
 
-Milestone 14 validation executed successfully:
+Milestone 15 validation executed successfully:
 
-- Frontend lint passed with Milestone 14 file health + repair UI changes.
-- Frontend production build passed after allowing networked build (Next.js font fetch during build).
-- Repair action wiring verified against existing satellite `POST /repair` response contract:
-- `target_replication_factor`
-- `repaired_shards`
-- `new_replicas`
+- Backend compile passed for new agent crate:
+- `cargo build -p dsprout-agent`
+- Frontend lint passed with new control panel page and links.
+- Frontend production build passed after allowing networked font fetch.
+- Local runtime smoke checks passed against agent endpoints:
+- `GET /status` succeeded
+- `GET /storage` succeeded
+- `POST /start` succeeded
+- `POST /stop` succeeded
 
 ## remaining warnings/issues
 
 - `/upload` and `/download` currently use base64 payloads/responses for minimal UI integration; large files are not optimized.
-- No auth on file action endpoints yet (intentionally out of scope for this milestone).
+- No auth on satellite file actions or local agent endpoints yet (intentionally out of scope).
 - Satellite file actions assume local sibling `dsprout-uplink` binary availability.
-- File health status is computed from current `/manifest` + `/locate` data; no separate backend health endpoint exists yet.
-- Dashboard still does not include advanced queue/progress UX.
+- File health status is computed from `/manifest` + `/locate`; no dedicated backend health endpoint exists yet.
+- Agent process/state is local-only and intentionally minimal (no desktop packaging, no cloud control plane yet).
 - No desktop packaging/cloud deployment/protocol refactors yet (intentionally out of scope).
 
 ## next milestone start guidance
